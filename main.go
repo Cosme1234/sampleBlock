@@ -18,8 +18,10 @@ import (
 
 var myenv map[string]string
 
-const envLoc = ".env"
-const ErrTransactionWait = "if you've just started the application, wait a while for the network to confirm your transaction."
+const (
+	envLoc             = ".env"
+	ErrTransactionWait = "if you've just started the application, wait a while for the network to confirm your transaction."
+)
 
 func loadEnv() {
 	var err error
@@ -31,18 +33,20 @@ func loadEnv() {
 func main() {
 	loadEnv()
 
-	// ctx := context.Background()
-	session := NewSession(context.Background())
+	// Load and init variables
+	ctx := context.Background()
+
+	// Connect to Ethereum gateway
 	client, err := ethclient.Dial(myenv["GATEWAY"])
 	if err != nil {
 		log.Fatalf("could not connect to Ethereum gateway: %v\n", err)
 	}
 	defer client.Close()
 
-	// accountAddress := common.HexToAddress("772043b2d0804ce4b00e5e66140cb406")
-	// balance, _ := client.BalanceAt(ctx, accountAddress, nil)
-	// fmt.Printf("Balance: %d\n", balance)
-	// fmt.Println(myenv)
+	// Init new authenticated session
+	session := NewSession(ctx)
+
+	// Load or Deploy contract, and update session with contract instance
 	if myenv["CONTRACTADDR"] == "" {
 		session = NewContract(session, client, myenv["QUESTION"], myenv["ANSWER"])
 	}
@@ -51,13 +55,16 @@ func main() {
 	if myenv["CONTRACTADDR"] != "" {
 		session = LoadContract(session, client)
 	}
+
+	// Loop to implement simple CLI
 	for {
 		fmt.Printf(
 			"Pick an option:\n" + "" +
 				"1. Show question.\n" +
 				"2. Send answer.\n" +
 				"3. Check if you answered correctly.\n" +
-				"4. Exit.\n",
+				"4. Exit.\n" +
+				"5. Reset and exit.\n",
 		)
 
 		// Reads a single UTF-8 character (rune)
@@ -76,6 +83,10 @@ func main() {
 		case "4":
 			fmt.Println("Bye!")
 			return
+		case "5":
+			fmt.Println("Cleared contract address. Bye!")
+			updateEnvFile("CONTRACTADDR", "")
+			return
 		default:
 			fmt.Println("Invalid option. Please try again.")
 			break
@@ -83,61 +94,29 @@ func main() {
 	}
 }
 
-// readStringStdin reads a string from STDIN and strips any trailing \n characters from it.
-func readStringStdin() string {
-	reader := bufio.NewReader(os.Stdin)
-	inputVal, err := reader.ReadString('\n')
+//// Contract initialization functions
 
-	if err != nil {
-		log.Printf("invalid option: %v\n", err)
-		return ""
-	}
-
-	output := strings.Trim(inputVal, "\n") // Important!
-	// output = strings.TrimSuffix(inputVal, " ")
-	fmt.Print(output, "value")
-	return output
-	// ln := ""
-	// fmt.Scanln(ln)
-	// return inputVal
-}
-
-func NewSession(ctx context.Context) (session quiz.QuizSession) {
-	loadEnv()
-	keystore, err := os.Open(myenv["KEYSTORE"])
-	if err != nil {
-		log.Printf(
-			"could not load keystore from location %s: %v\n",
-			myenv["KEYSTORE"],
-			err,
-		)
-	}
-	defer keystore.Close()
-
-	keystorepass := myenv["KEYSTOREPASS"]
-	auth, err := bind.NewTransactor(keystore, keystorepass)
-	if err != nil {
-		log.Printf("%s\n", err)
-	}
-
-	// Return session without contract instance
-	return quiz.QuizSession{
-		TransactOpts: *auth,
-		CallOpts: bind.CallOpts{
-			From:    auth.From,
-			Context: ctx,
-		},
-	}
-}
+// NewContract deploys a contract if no existing contract exists
 func NewContract(session quiz.QuizSession, client *ethclient.Client, question string, answer string) quiz.QuizSession {
 	loadEnv()
+
+	// Test our inputs
+	if myenv["CONTRACTADDR"] != "" {
+		return session
+	}
+	if question == "" {
+		log.Printf("question field cannot be empty\n")
+		return session
+	}
+	if answer == "" {
+		log.Printf("answer field cannot be empty\n")
+		return session
+	}
 
 	// Hash answer before sending it over Ethereum network.
 	contractAddress, tx, instance, err := quiz.DeployQuiz(&session.TransactOpts, client, question, stringToKeccak256(answer))
 	if err != nil {
-		fmt.Println("Fulano?")
 		log.Fatalf("could not deploy contract: %v\n", err)
-
 	}
 	fmt.Printf("Contract deployed! Wait for tx %s to be confirmed.\n", tx.Hash().Hex())
 
@@ -150,6 +129,10 @@ func NewContract(session quiz.QuizSession, client *ethclient.Client, question st
 func LoadContract(session quiz.QuizSession, client *ethclient.Client) quiz.QuizSession {
 	loadEnv()
 
+	if myenv["CONTRACTADDR"] == "" {
+		log.Println("could not find a contract address to load")
+		return session
+	}
 	addr := common.HexToAddress(myenv["CONTRACTADDR"])
 	instance, err := quiz.NewQuiz(addr, client)
 	if err != nil {
@@ -160,23 +143,48 @@ func LoadContract(session quiz.QuizSession, client *ethclient.Client) quiz.QuizS
 	return session
 }
 
-// Utility functions
+// NewSession returns a quiz.QuizSession struct that
+// contains an authentication key to sign transactions with.
+func NewSession(ctx context.Context) (session quiz.QuizSession) {
+	loadEnv()
 
-// stringToKeccak256 converts a string to a keccak256 hash of type [32]byte
-func stringToKeccak256(s string) [32]byte {
-	var output [32]byte
-	copy(output[:], crypto.Keccak256([]byte(s))[:])
-	return output
-}
-
-// updateEnvFile updates our env file with a key-value pair
-func updateEnvFile(k string, val string) {
-	myenv[k] = val
-	err := godotenv.Write(myenv, envLoc)
+	// Create new transactor
+	keystore, err := os.Open(myenv["KEYSTORE"])
 	if err != nil {
-		log.Printf("failed to update %s: %v\n", envLoc, err)
+		log.Printf(
+			"could not load keystore from location %s: %v\n",
+			myenv["KEYSTORE"],
+			err,
+		)
+	}
+	defer keystore.Close()
+
+	auth, err := bind.NewTransactor(keystore, myenv["KEYSTOREPASS"])
+	if err != nil {
+		log.Printf("%s\n", err)
+	}
+
+	// bind.NewTransactor() returns a bind.TransactOpts{} struct with the following field values:
+	// From: auth.From,
+	// Signer: auth.Signer,
+	// Nonce: nil // Setting to nil uses nonce of pending state
+	// Value: big.NewInt(0), // 0 because we're not transferring Eth
+	// GasPrice: nil // Setting to nil automatically suggests a gas price
+	// GasLimit: 0 // Setting to 0 automatically estimates gas limit
+
+	// Return session without contract instance
+	return quiz.QuizSession{
+		TransactOpts: *auth,
+		CallOpts: bind.CallOpts{
+			From:    auth.From,
+			Context: ctx,
+		},
 	}
 }
+
+//// Contract interaction functions
+
+// readQuestion prints out question stored in contract.
 func readQuestion(session quiz.QuizSession) {
 	qn, err := session.Question()
 	if err != nil {
@@ -211,4 +219,35 @@ func checkCorrect(session quiz.QuizSession) {
 	}
 	fmt.Printf("Were you correct?: %v\n", win)
 	return
+}
+
+//// Utility functions
+
+// updateEnvFile saves the contract address to our .env file
+func updateEnvFile(k string, val string) {
+	myenv[k] = val
+	err := godotenv.Write(myenv, envLoc)
+	if err != nil {
+		log.Printf("failed to update %s: %v\n", envLoc, err)
+	}
+}
+
+// readStringStdin reads a string from STDIN and strips any trailing \n characters from it.
+func readStringStdin() string {
+	reader := bufio.NewReader(os.Stdin)
+	inputVal, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("invalid option: %v\n", err)
+		return ""
+	}
+
+	output := strings.TrimSuffix(inputVal, "\n") // Important!
+	return output
+}
+
+// stringToKeccak256 converts a string to a keccak256 hash of type [32]byte
+func stringToKeccak256(s string) [32]byte {
+	var output [32]byte
+	copy(output[:], crypto.Keccak256([]byte(s))[:])
+	return output
 }
